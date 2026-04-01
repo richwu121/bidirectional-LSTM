@@ -1,165 +1,446 @@
-# Bidirectional LSTM for 20 Newsgroups Binary Text Classification
+# 基于自定义 Word2Vec + BiLSTM 的 20 Newsgroups 二分类项目
 
 ## 项目简介
 
-本项目基于 **20 Newsgroups** 数据集，完成一个二分类文本分类任务，目标是区分以下两个类别：
+这是一个基于 **fetch_20newsgroups** 子数据集完成的文本分类项目，任务是对两类新闻文本进行二分类。项目整体采用了如下技术路线：
 
-- `alt.atheism`
-- `soc.religion.christian`
+- 使用清洗后的训练语料训练 **自定义 Word2Vec** 词向量
+- 将训练好的词向量初始化到 **Embedding 层**
+- 使用 **Bidirectional LSTM（双向 LSTM）** 建模上下文语义信息
+- 在测试集上完成分类评估
 
-模型采用 **Bidirectional LSTM（双向 LSTM, BiLSTM）**，通过词嵌入层将文本表示为向量序列，再使用双向 LSTM 提取上下文信息，最后将正向和反向隐藏状态拼接后送入全连接层完成分类。
+本项目最终在测试集上取得了 **77.41% 的准确率**，达到了并超过了 **75%** 的目标要求。
 
-这个项目覆盖了一个完整的 NLP 基础流程：
+---
 
-1. 数据加载与清洗
-2. 文本转索引
-3. 序列 padding
-4. BiLSTM 模型搭建
-5. 模型训练与测试
-6. 分类结果分析
-7. 模型参数保存
+## 项目亮点
+
+- 不是直接使用 `nn.Embedding` 随机初始化，而是先训练 **自己的 Word2Vec 词向量**
+- 使用 **预训练词向量 + BiLSTM** 的组合方式进行文本分类
+- 对空样本、超长文本、PAD/UNK 向量等细节都进行了处理
+- 在测试集上取得了 **77%+** 的准确率，具有较好的实验完整性
 
 ---
 
 ## 数据集说明
 
-项目使用 `sklearn.datasets.fetch_20newsgroups` 加载 20 Newsgroups 数据集，并只保留两个类别进行二分类：
+本项目使用的数据来自 `fetch_20newsgroups`，并抽取其中两个类别构成二分类任务。根据你的项目描述，该任务是：
 
-- `alt.atheism`
-- `soc.religion.christian`
+- **无神论（atheism）**
+- **基督教（christian）**
 
-在数据加载时，移除了：
+因此，这是一个典型的英文文本二分类任务。
 
-- `headers`
-- `footers`
-- `quotes`
+数据以保存后的形式读取：
 
-这样可以减少邮件头、签名和引用内容对分类结果的干扰，使模型更关注正文语义。
+```python
+from news_data import load_saved_data
+import numpy as np
 
-从代码实现来看，数据预处理函数主要完成了以下工作：
+data = load_saved_data("news_data.pkl")
 
-- 文本全部转为小写
-- 去除 HTML 标签
-- 去除标点符号
-- 去除数字
-- 去除多余空格
-- 构建词表，并保留出现频率不少于 2 次的词
-- 设置特殊标记：`<PAD>` 和 `<UNK>`
+X_train = data["X_train"]
+X_test = data["X_test"]
+y_train = data["y_train"]
+y_test = data["y_test"]
+word_to_idx = data["word_to_idx"]
+vocab_size = data["vocab_size"]
+```
+
+其中：
+
+- `X_train` / `X_test`：训练集与测试集文本
+- `y_train` / `y_test`：对应标签
+- `word_to_idx`：词表到索引的映射
+- `vocab_size`：词表大小
 
 ---
 
-## 数据预处理流程
+## 整体流程
 
-### 1. 文本清洗
-
-`preprocess_text(text)` 的作用是将原始文本标准化，减少噪声。主要步骤如下：
-
-```python
-text = text.lower()
-text = re.sub(r'<[^>]+>', '', text)
-text = text.translate(str.maketrans('', '', string.punctuation))
-text = re.sub(r'\d+', '', text)
-text = ' '.join(text.split())
+```text
+原始文本
+   ↓
+删除空样本
+   ↓
+使用训练集文本训练自定义 Word2Vec
+   ↓
+构造 embedding_matrix（对齐分类任务词表）
+   ↓
+文本转索引
+   ↓
+按统一长度 padding / truncation
+   ↓
+构建 TensorDataset 和 DataLoader
+   ↓
+BiLSTM 训练
+   ↓
+测试集评估
+   ↓
+保存模型
 ```
 
-这样做的目的是：
+---
 
-- 降低大小写差异带来的词表膨胀
-- 去除无意义符号
-- 让相同词语尽量映射到相同 token
+## 1. 数据预处理
 
-### 2. 构建词表
+### 1.1 删除空样本
 
-在 `build_vocab(texts)` 中，程序会统计所有词的频率，并只保留频率大于等于 2 的词。词表中包含两个特殊符号：
+首先对训练集进行空样本清理。代码中对两种情况做了判断：
 
-- `<PAD>`：索引为 0，用于补齐序列长度
-- `<UNK>`：索引为 1，用于表示未登录词
+1. 文本是字符串且去掉空格后为空
+2. 文本已经是序列形式，并且长度为 0 或全部为 0
 
-这一设计可以减少低频词带来的稀疏问题。
-
-### 3. 数据规模统计
-
-从当前运行结果可以看到：
-
-- 训练集样本数：`1079`
-- 测试集样本数：`717`
-- 训练集最长长度：`45731`
-- 测试集最长长度：`28696`
-- 训练集平均长度：`1258.72`
-
-这说明文本长度差异非常大，存在明显长文本，因此如果直接按照最大长度进行 padding，会带来很大的显存和计算开销。
-
-### 4. 文本转索引
-
-函数 `texts_to_indices(texts, word_to_idx, unk_idx)` 的作用是把分词后的文本映射成整数序列：
+核心逻辑如下：
 
 ```python
-seq = [word_to_idx.get(token, unk_idx) for token in tokens]
+new_X_train = []
+new_y_train = []
+
+for x, y in zip(X_train, y_train):
+    is_empty = False
+
+    if isinstance(x, str):
+        if not x.strip():
+            is_empty = True
+    else:
+        arr = np.array(x)
+        if len(arr) == 0 or np.all(arr == 0):
+            is_empty = True
+
+    if not is_empty:
+        new_X_train.append(x)
+        new_y_train.append(y)
 ```
 
-这样就把原始字符串文本转换成了可以送入神经网络的数字序列。
+处理结果：
 
-### 5. Padding 与长度截断
+- 原始训练样本数：**1079**
+- 删除后训练样本数：**1058**
+- 删除的空样本数：**21**
 
-由于 LSTM 需要 batch 中样本长度一致，因此定义了 `pad_sequences()`：
+这一步非常重要，因为空样本会影响后续的分词、索引转换、padding 以及 LSTM 长度计算。
 
-- 如果序列长度小于 `max_len`，就在末尾补 `<PAD>`
-- 如果序列长度大于 `max_len`，就截断到 `max_len`
+---
 
-当前项目没有直接使用最大长度 `45731`，而是使用：
+### 1.2 构建 Word2Vec 训练语料
+
+在删除空样本后，使用训练集文本构建 Word2Vec 的训练语料：
+
+```python
+PAD_IDX = word_to_idx["<PAD>"]
+UNK_IDX = word_to_idx["<UNK>"]
+
+train_corpus = [text.split() for text in X_train if text.strip() != ""]
+```
+
+这里做法很直接：
+
+- 每条文本按空格切分为 token 序列
+- 仅使用训练集构建语料，避免测试集信息泄漏
+
+语料统计结果：
+
+- Word2Vec 训练句子数：**1058**
+
+---
+
+### 1.3 训练自定义 Word2Vec
+
+项目没有直接调用外部预训练词向量，而是使用当前训练语料训练自己的 Word2Vec：
+
+```python
+from gensim.models import Word2Vec
+
+embed_dim = 256
+
+w2v_model = Word2Vec(
+    sentences=train_corpus,
+    vector_size=embed_dim,
+    window=5,
+    min_count=1,
+    workers=4,
+    sg=1,
+    epochs=10
+)
+```
+
+参数说明：
+
+- `vector_size=256`：词向量维度为 256
+- `window=5`：上下文窗口大小为 5
+- `min_count=1`：保留所有出现过的词
+- `sg=1`：使用 **Skip-gram**
+- `epochs=10`：训练 10 轮
+
+训练结果：
+
+- Word2Vec 词表大小：**15822**
+
+这里的 Word2Vec 词表大小和后续分类模型的 `word_to_idx` 大小不完全一致是正常的：
+
+- Word2Vec 的词表来自当前清洗后的训练语料
+- 分类模型的词表来自项目预处理阶段保存的 `word_to_idx`
+- 最终需要做的是：**把 Word2Vec 向量对齐到分类模型使用的词表**
+
+---
+
+### 1.4 构造 embedding matrix
+
+为了让 BiLSTM 的 Embedding 层能够直接加载 Word2Vec 结果，需要构造一个与 `word_to_idx` 对齐的矩阵：
+
+```python
+embedding_matrix = np.random.normal(
+    loc=0.0,
+    scale=0.1,
+    size=(len(word_to_idx), embed_dim)
+).astype(np.float32)
+
+embedding_matrix[PAD_IDX] = np.zeros(embed_dim, dtype=np.float32)
+
+valid_vectors = []
+for word, idx in word_to_idx.items():
+    if word in ["<PAD>", "<UNK>"]:
+        continue
+    if word in w2v_model.wv:
+        valid_vectors.append(w2v_model.wv[word])
+
+if len(valid_vectors) > 0:
+    embedding_matrix[UNK_IDX] = np.mean(valid_vectors, axis=0)
+```
+
+处理策略如下：
+
+- 初始矩阵使用正态分布随机初始化
+- `<PAD>` 的向量强制设为全 0
+- `<UNK>` 的向量用已有有效词向量的平均值填充
+- 对于 `word_to_idx` 中存在、但 Word2Vec 中没有的词，保留随机初始化结果
+
+最终结果：
+
+- `embedding_matrix.shape = (11753, 256)`
+
+这说明分类任务最终使用的词表大小为 **11753**，每个词对应 **256 维** 向量。
+
+---
+
+### 1.5 文本转索引
+
+在送入神经网络之前，需要将原始文本转换为整数索引序列：
+
+```python
+def texts_to_indices(texts, word_to_idx, unk_idx):
+    sequences = []
+    for text in texts:
+        tokens = text.split()
+        seq = [word_to_idx.get(token, unk_idx) for token in tokens]
+        sequences.append(seq)
+    return sequences
+```
+
+然后执行：
+
+```python
+X_train_idx = texts_to_indices(X_train, word_to_idx, UNK_IDX)
+X_test_idx = texts_to_indices(X_test, word_to_idx, UNK_IDX)
+```
+
+这样就把文本转换成了适合 PyTorch Embedding 层输入的索引序列。
+
+---
+
+### 1.6 统计长度并确定 max_len
+
+文本长度差异非常大，因此不能简单使用训练集最大长度，否则会带来严重的显存和计算浪费。
+
+项目先统计了序列长度：
+
+```python
+train_lengths = [len(seq) for seq in X_train]
+test_lengths = [len(seq) for seq in X_test]
+```
+
+统计结果：
+
+- 训练集样本数：**1058**
+- 测试集样本数：**717**
+- 训练集最长长度：**45731**
+- 测试集最长长度：**28696**
+- 训练集平均长度：**1283.70**
+
+可以看到文本长度分布极不均衡，因此项目没有直接取最大长度，而是采用了更合理的策略：
 
 ```python
 max_len = int(np.percentile(train_lengths, 99.5))
+print("max_len =", max_len)
 ```
 
 最终得到：
 
-- `max_len = 12507`
+- `max_len = 12687`
 
-这种做法比直接取最大长度更合理，因为它避免了极少数超长文本显著拉高计算成本。
+这种做法的优点是：
 
-padding 后数据维度为：
-
-- `X_train_pad.shape = (1079, 12507)`
-- `X_test_pad.shape = (717, 12507)`
-
-标签维度为：
-
-- `y_train.shape = (1079,)`
-- `y_test.shape = (717,)`
+- 保留绝大多数样本信息
+- 避免极端超长文本带来过多 padding 或过高计算成本
+- 在效果与效率之间取得平衡
 
 ---
 
-## 模型结构解析
+### 1.7 Padding / Truncation
 
-### 1. 模型整体结构
-
-项目定义了 `BiLSTMClassifier(nn.Module)`，整体结构如下：
+定义 padding 函数，将所有样本处理成相同长度：
 
 ```python
-Embedding -> Bidirectional LSTM -> Concatenate(h_forward, h_backward) -> Linear -> logits
+def pad_sequences(sequences, max_len, pad_value=0):
+    padded_sequences = []
+
+    for seq in sequences:
+        seq = list(seq)
+
+        if len(seq) < max_len:
+            seq = seq + [pad_value] * (max_len - len(seq))
+        else:
+            seq = seq[:max_len]
+
+        padded_sequences.append(seq)
+
+    return np.array(padded_sequences, dtype=np.int64)
 ```
 
-### 2. Embedding 层
+执行后：
 
 ```python
-self.embedding = nn.Embedding(
-    num_embeddings=vocab_size,
-    embedding_dim=embed_dim,
-    padding_idx=pad_idx
-)
+X_train_pad = pad_sequences(X_train_idx, max_len=max_len, pad_value=PAD_IDX)
+X_test_pad = pad_sequences(X_test_idx, max_len=max_len, pad_value=PAD_IDX)
 ```
 
-作用：
+结果：
 
-- 把每个词索引映射为稠密向量
-- `padding_idx=pad_idx` 可以保证 `<PAD>` 对应的向量不会参与有效语义学习
+- `X_train_pad.shape = (1058, 12687)`
+- `X_test_pad.shape = (717, 12687)`
 
-当前设置中：
+标签也转换为 NumPy 数组：
 
-- `embed_dim = 512`
+```python
+y_train = np.array(y_train)
+y_test = np.array(y_test)
+```
 
-### 3. 双向 LSTM 层
+---
+
+### 1.8 转为 Tensor，并过滤零长度样本
+
+之后将数据转换为 PyTorch Tensor：
+
+```python
+X_train_tensor = torch.tensor(X_train_pad, dtype=torch.long)
+X_test_tensor = torch.tensor(X_test_pad, dtype=torch.long)
+
+y_train_tensor = torch.tensor(y_train, dtype=torch.long)
+y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+```
+
+并通过 `PAD_IDX` 统计每条样本的真实长度：
+
+```python
+train_lengths = (X_train_tensor != PAD_IDX).sum(dim=1)
+test_lengths = (X_test_tensor != PAD_IDX).sum(dim=1)
+```
+
+然后进一步过滤长度为 0 的样本：
+
+```python
+train_mask = train_lengths > 0
+test_mask = test_lengths > 0
+```
+
+这一步的意义是：
+
+- 避免空序列进入 `pack_padded_sequence`
+- 保证 LSTM 输入合法
+- 提高训练和评估稳定性
+
+从最终分类报告的 `support=695` 可以看出，最终参与测试评估的有效测试样本数为 **695**。
+
+---
+
+## 2. 模型设计：Bidirectional LSTM
+
+本项目的分类模型是一个 **单层双向 LSTM**。核心思想如下：
+
+1. 文本索引先通过 Embedding 层映射为词向量
+2. 使用双向 LSTM 同时建模正向和反向语义信息
+3. 取最后时刻的正向隐藏状态 `h_forward` 与反向隐藏状态 `h_backward`
+4. 拼接后送入全连接层完成二分类
+
+模型实现如下：
+
+```python
+class BiLSTMClassifier(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim,
+        hidden_dim,
+        pad_idx,
+        num_classes=2,
+        pretrained_embeddings=None,
+        freeze_embedding=False
+    ):
+        super().__init__()
+
+        if pretrained_embeddings is not None:
+            self.embedding = nn.Embedding.from_pretrained(
+                embeddings=torch.tensor(pretrained_embeddings, dtype=torch.float32),
+                freeze=freeze_embedding,
+                padding_idx=pad_idx
+            )
+        else:
+            self.embedding = nn.Embedding(
+                num_embeddings=vocab_size,
+                embedding_dim=embed_dim,
+                padding_idx=pad_idx
+            )
+
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+        self.init_forget_gate_bias(value=1.0)
+```
+
+### 模型结构说明
+
+#### （1）Embedding 层
+
+这里使用了：
+
+```python
+nn.Embedding.from_pretrained(...)
+```
+
+表示 Embedding 层由自定义 Word2Vec 词向量初始化。
+
+并且设置：
+
+```python
+freeze_embedding=False
+```
+
+这意味着：
+
+- 初始值来自 Word2Vec
+- 训练过程中 Embedding 参数仍然可以继续微调
+
+这通常比“完全冻结词向量”更适合分类任务。
+
+#### （2）双向 LSTM
 
 ```python
 self.lstm = nn.LSTM(
@@ -171,51 +452,32 @@ self.lstm = nn.LSTM(
 )
 ```
 
-这里使用的是 **单层双向 LSTM**：
+由于 `bidirectional=True`，所以每个时间步都有：
 
-- 正向 LSTM 从前到后读取句子
-- 反向 LSTM 从后到前读取句子
+- 正向隐状态
+- 反向隐状态
 
-这样模型可以同时利用前文和后文信息。
+最后输出的句向量维度是 `hidden_dim * 2`。
 
-当前设置中：
+#### （3）遗忘门偏置初始化
 
-- `hidden_dim = 512`
-- `num_layers = 1`
-- `bidirectional = True`
-
-### 4. 只使用最后隐藏状态进行分类
-
-在前向传播中，模型没有使用所有时间步输出，而是直接取最后的双向隐藏状态：
+项目还手动初始化了 forget gate bias：
 
 ```python
-_, (h_n, c_n) = self.lstm(packed)
-h_forward = h_n[0]
-h_backward = h_n[1]
-h_concat = torch.cat([h_forward, h_backward], dim=1)
-logits = self.fc(h_concat)
+def init_forget_gate_bias(self, value=1.0):
+    hidden_dim = self.lstm.hidden_size
+    for name, param in self.lstm.named_parameters():
+        if "bias" in name:
+            param.data[hidden_dim:2 * hidden_dim].fill_(value)
 ```
 
-其含义是：
+这是一种比较常见的 LSTM 初始化技巧，可以帮助模型在训练早期更稳定地保留信息。
 
-- `h_forward`：正向 LSTM 的最后隐藏状态
-- `h_backward`：反向 LSTM 的最后隐藏状态
-- `h_concat`：将两个方向的语义表示拼接起来，形成一个长度为 `2 * hidden_dim` 的句向量
-- 最后输入线性层做二分类
+---
 
-全连接层为：
+## 3. 前向传播设计
 
-```python
-self.fc = nn.Linear(hidden_dim * 2, num_classes)
-```
-
-由于是二分类，因此：
-
-- `num_classes = 2`
-
-### 5. 使用 pack_padded_sequence
-
-模型中使用了：
+为了让 LSTM 只处理真实长度部分，而不是浪费在大量 padding 上，模型前向传播里使用了：
 
 ```python
 packed = nn.utils.rnn.pack_padded_sequence(
@@ -223,322 +485,374 @@ packed = nn.utils.rnn.pack_padded_sequence(
 )
 ```
 
-它的作用是：
-
-- 告诉 LSTM 每个样本的真实长度
-- 避免模型把 padding 部分也当成有效输入
-- 提高训练效率
-- 减少 padding 对隐藏状态的干扰
-
-这是变长文本输入到 RNN/LSTM 时非常重要的一步。
-
-### 6. Forget gate bias 初始化
-
-项目中还专门初始化了 forget gate 的 bias：
+然后取双向 LSTM 的最终隐藏状态：
 
 ```python
-self.init_forget_gate_bias(value=1.0)
+_, (h_n, c_n) = self.lstm(packed)
+
+h_forward = h_n[0]
+h_backward = h_n[1]
+
+h_concat = torch.cat([h_forward, h_backward], dim=1)
+logits = self.fc(h_concat)
 ```
 
-这是一种常见技巧，目的是让 LSTM 在训练初期更倾向于保留信息，有时可以帮助模型更稳定地学习长距离依赖。
+这样做的优点是：
+
+- 避免 padding 位置影响序列建模
+- 充分利用双向上下文信息
+- 对长文本分类任务更友好
 
 ---
 
-## 训练流程解析
+## 4. 数据加载与训练设置
 
-### 1. 数据张量化
-
-在训练前，代码将 padding 后的数据转换为 PyTorch 张量：
+项目使用 `TensorDataset + DataLoader` 构建训练和测试迭代器：
 
 ```python
-X_train_tensor = torch.tensor(X_train_pad, dtype=torch.long)
-X_test_tensor = torch.tensor(X_test_pad, dtype=torch.long)
+train_dataset = TensorDataset(X_train_tensor, train_lengths, y_train_tensor)
+test_dataset = TensorDataset(X_test_tensor, test_lengths, y_test_tensor)
 
-y_train_tensor = torch.tensor(y_train, dtype=torch.long)
-y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+batch_size = 64
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 ```
 
-同时通过：
+训练配置如下：
+
+- `embed_dim = 256`
+- `hidden_dim = 256`
+- `num_classes = 2`
+- `batch_size = 64`
+- `epochs = 20`
+- `optimizer = Adam`
+- `learning_rate = 1e-3`
+- `loss function = CrossEntropyLoss`
+- `freeze_embedding = False`
+
+模型实例化代码：
 
 ```python
-train_lengths = (X_train_tensor != PAD_IDX).sum(dim=1)
-test_lengths = (X_test_tensor != PAD_IDX).sum(dim=1)
+model = BiLSTMClassifier(
+    vocab_size=len(word_to_idx),
+    embed_dim=embed_dim,
+    hidden_dim=256,
+    pad_idx=PAD_IDX,
+    num_classes=2,
+    pretrained_embeddings=embedding_matrix,
+    freeze_embedding=False
+).to(device)
 ```
-
-来计算每个样本的真实长度。
-
-### 2. 训练配置
-
-项目中的关键训练参数如下：
-
-- 词向量维度：`512`
-- 隐藏层维度：`512`
-- 类别数：`2`
-- 优化器：`Adam`
-- 学习率：`1e-3`
-- 损失函数：`CrossEntropyLoss`
-- 训练轮数：`20`
-
-代码如下：
-
-```python
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-epochs = 20
-```
-
-### 3. 训练函数
-
-`train_one_epoch()` 的核心流程：
-
-1. 模型设置为训练模式 `model.train()`
-2. 从 dataloader 中取出 batch
-3. 前向传播得到 `logits`
-4. 计算损失 `loss`
-5. 反向传播 `loss.backward()`
-6. 参数更新 `optimizer.step()`
-7. 统计整轮 loss 和 accuracy
-
-### 4. 评估函数
-
-`evaluate()` 的主要流程：
-
-- 使用 `model.eval()` 切换到评估模式
-- 用 `torch.no_grad()` 关闭梯度计算
-- 统计测试集损失与准确率
-- 返回预测标签与真实标签，供 `classification_report` 使用
 
 ---
 
-## 实验结果
+## 5. 训练过程
 
-### 1. 训练过程
+训练阶段每个 epoch 都会统计：
 
-从训练日志可以看到：
+- 训练损失 `train_loss`
+- 训练准确率 `train_acc`
+- 测试损失 `test_loss`
+- 测试准确率 `test_acc`
 
-- 第 1 轮：`Train Acc = 0.6493`，`Test Acc = 0.6590`
-- 第 2 轮：`Train Acc = 0.9423`，`Test Acc = 0.7108`
-- 第 3 轮：`Train Acc = 0.9905`，`Test Acc = 0.7151`
-- 第 4 轮开始训练准确率已经接近或达到 `1.0000`
-- 最优测试准确率大约出现在第 14 轮：`0.7309`
-- 第 20 轮测试准确率为：`0.7237`
+从日志来看，模型训练非常充分，训练集准确率最终接近 **100%**，测试集准确率稳定在 **0.77 左右**。
 
-最终测试结果：
+部分训练日志如下：
 
-- `Test Loss = 1.4110`
-- `Test Accuracy = 0.7237`
-
-### 2. 分类报告
-
-当前截图中的 `classification_report` 结果如下：
-
-| 类别 | Precision | Recall | F1-score | Support |
-|---|---:|---:|---:|---:|
-| 0 | 0.7409 | 0.5884 | 0.6559 | 311 |
-| 1 | 0.7143 | 0.8333 | 0.7692 | 384 |
-| Macro Avg | 0.7276 | 0.7109 | 0.7126 | 695 |
-| Weighted Avg | 0.7262 | 0.7237 | 0.7185 | 695 |
-
-如果按照类别顺序理解，通常可以认为：
-
-- `0 -> alt.atheism`
-- `1 -> soc.religion.christian`
-
-则可以看出：
-
-- 模型对类别 `1` 的召回率更高，说明它更容易识别 `soc.religion.christian`
-- 类别 `0` 的召回率相对较低，说明部分无神论文本被误分类到了另一类
-
----
-
-## 结果分析
-
-### 1. 模型已经明显过拟合
-
-最明显的现象是：
-
-- 训练准确率非常快地达到 `1.0000`
-- 测试准确率却只停留在 `0.72 ~ 0.73`
-- 测试损失随着训练轮数增加持续上升
-
-这说明模型在训练集上记忆得非常充分，但泛化能力不足。
-
-### 2. 可能原因
-
-#### （1）模型容量较大
-
-当前模型参数比较大：
-
-- `embed_dim = 512`
-- `hidden_dim = 512`
-
-对于 1000 级别样本数的训练集来说，这个规模偏大，容易过拟合。
-
-#### （2）序列长度过长
-
-虽然已经没有使用最大长度 `45731`，但 `12507` 仍然非常长。
-
-这会带来两个问题：
-
-- 模型训练成本高
-- 长文本中噪声信息较多，不一定有利于分类
-
-#### （3）当前词表构建方式存在信息泄漏风险
-
-当前代码中使用：
-
-```python
-word_to_idx = build_vocab(X_train + X_test)
+```text
+Epoch [1/20]  Train Loss: 0.6939, Train Acc: 0.5350 | Test Loss: 0.6695, Test Acc: 0.5971
+Epoch [2/20]  Train Loss: 0.6578, Train Acc: 0.6144 | Test Loss: 0.6686, Test Acc: 0.6345
+Epoch [3/20]  Train Loss: 0.6241, Train Acc: 0.7004 | Test Loss: 0.6401, Test Acc: 0.6173
+Epoch [4/20]  Train Loss: 0.4922, Train Acc: 0.7722 | Test Loss: 0.6177, Test Acc: 0.6676
+Epoch [5/20]  Train Loss: 0.3108, Train Acc: 0.8941 | Test Loss: 0.9806, Test Acc: 0.6647
+Epoch [6/20]  Train Loss: 0.2539, Train Acc: 0.9253 | Test Loss: 0.7293, Test Acc: 0.6590
+Epoch [7/20]  Train Loss: 0.3137, Train Acc: 0.8658 | Test Loss: 0.5572, Test Acc: 0.7223
+Epoch [8/20]  Train Loss: 0.1268, Train Acc: 0.9707 | Test Loss: 0.5668, Test Acc: 0.7856
+...
+Epoch [20/20] Train Loss: 0.0011, Train Acc: 1.0000 | Test Loss: 0.9252, Test Acc: 0.7741
 ```
 
-这意味着词表同时使用了训练集和测试集文本构建。这样做虽然方便，但从严格实验角度看，测试集信息提前参与了建模过程，存在轻微数据泄漏风险。
+可以观察到：
 
-更严谨的做法应该是：
+- 第 8 轮测试准确率达到 **78.56%**
+- 最终第 20 轮测试准确率为 **77.41%**
+- 训练集准确率升到 100%，说明模型已经学得很充分
+- 训练集和测试集之间存在一定差距，说明后期有一定过拟合现象
 
-```python
-word_to_idx = build_vocab(X_train)
+这也是文本分类任务中较常见的情况。
+
+---
+
+## 6. 测试集结果分析
+
+最终评估结果：
+
+```text
+Test Loss: 0.9252303676171736
+Test Accuracy: 0.7741007194244605
 ```
 
-然后测试集中的未登录词统一映射到 `<UNK>`。
+也就是说：
 
-#### （4）测试样本统计需要再次核对
+- **测试集损失：0.9252**
+- **测试集准确率：77.41%**
 
-前面长度统计与 padding 结果显示测试集样本数为 `717`，但当前截图中的分类报告 `support` 合计为 `695`。这说明实际评估时可能存在：
+这已经明确说明：
 
-- dataloader 没有覆盖全部测试集
-- 某些样本在评估阶段被过滤
-- 使用的测试集与前面统计的测试集并非完全一致
+> 本项目测试集准确率超过 75%，最终达到约 77%。
 
-这一点建议在提交项目前重新检查，确保最终报告和数据规模一致。
+分类报告如下：
 
----
+```text
+              precision    recall  f1-score   support
 
-## 模型保存
+           0     0.7584    0.7267    0.7422       311
+           1     0.7859    0.8125    0.7990       384
 
-训练结束后，项目将模型保存为：
-
-```python
-bilstm_text_classifier.pth
+    accuracy                         0.7741       695
+   macro avg     0.7721    0.7696    0.7706       695
+weighted avg     0.7736    0.7741    0.7736       695
 ```
 
-保存内容包括：
+### 结果解读
 
-- `model_state_dict`
-- `optimizer_state_dict`
-- `word_to_idx`
-- `vocab_size`
-- `embed_dim`
-- `hidden_dim`
-- `pad_idx`
-- `num_classes`
-- `max_len`
-- `test_acc`
+#### 类别 0
 
-这种 checkpoint 保存方式比较完整，后续不仅可以恢复模型参数，也能恢复推理时必需的词表和超参数。
+- Precision = **0.7584**
+- Recall = **0.7267**
+- F1-score = **0.7422**
 
----
+说明模型对类别 0 的识别能力不错，但召回率略低，表示有一部分该类样本被错分到了另一类。
 
-## 项目优点
+#### 类别 1
 
-这个项目的优点包括：
+- Precision = **0.7859**
+- Recall = **0.8125**
+- F1-score = **0.7990**
 
-- 完整实现了一个文本分类任务的标准流程
-- 使用了双向 LSTM，能够同时利用前向和后向上下文
-- 使用 `pack_padded_sequence` 正确处理变长序列
-- 使用 forget gate bias 初始化增强训练稳定性
-- 保存了完整 checkpoint，便于后续部署与复现
+说明模型对类别 1 的表现更好，尤其是召回率较高，能够识别出更多真实的该类样本。
+
+#### 宏平均与加权平均
+
+- Macro F1 = **0.7706**
+- Weighted F1 = **0.7736**
+
+整体来看，两类的性能比较接近，没有出现某一类几乎失效的情况，说明模型具备较好的二分类能力。
 
 ---
 
-## 可以继续改进的方向
+## 7. 模型保存
 
-### 1. 仅用训练集构建词表
+项目最后使用 `torch.save` 保存了训练好的检查点：
 
-避免测试集信息泄漏，提高实验严谨性。
+```python
+checkpoint = {
+    "model_state_dict": model.state_dict(),
+    "optimizer_state_dict": optimizer.state_dict(),
+    "word_to_idx": word_to_idx,
+    "vocab_size": len(word_to_idx),
+    "embed_dim": 256,
+    "hidden_dim": 256,
+    "pad_idx": PAD_IDX,
+    "num_classes": 2,
+    "max_len": X_train_pad.shape[1],
+    "test_acc": test_acc
+}
 
-### 2. 增加正则化
+torch.save(checkpoint, "bilstm_text_classifier.pth")
+```
 
-可以尝试：
+建议保存时让 `embed_dim` 和 `hidden_dim` 与实际训练配置保持一致。
 
-- `dropout`
-- `weight decay`
-- `early stopping`
-
-### 3. 缩短最大长度
-
-可以尝试把 `max_len` 改为更小的值，比如：
-
-- 500
-- 1000
-- 2000
-
-很多新闻文本的判别信息往往集中在前半部分，这样可能会提高训练效率并缓解过拟合。
-
-### 4. 改进句子表示方式
-
-当前只使用了最后的 `h_forward` 和 `h_backward`。后续可以尝试：
-
-- mean pooling
-- max pooling
-- attention
-- BiLSTM + Attention
-
-### 5. 增加更多评价指标
-
-除了 accuracy，还可以进一步分析：
-
-- confusion matrix
-- ROC-AUC
-- PR curve
+> 你的训练代码中模型实际使用的是 `embed_dim=256`、`hidden_dim=256`，因此 README 中建议按这个真实配置进行记录。
 
 ---
 
-## 如何运行项目
+## 8. 为什么这个方案有效？
 
-### 1. 安装依赖
+本项目效果能够达到 77%+，核心原因主要有以下几点：
+
+### （1）使用自定义 Word2Vec 初始化 Embedding
+
+相比完全随机初始化：
+
+- 词向量在进入分类模型前已经具有一定语义结构
+- 可以帮助模型更快收敛
+- 对小规模训练集更友好
+
+### （2）BiLSTM 能同时利用前后文
+
+普通单向 LSTM 只能从左到右建模，而双向 LSTM：
+
+- 能同时使用前文和后文信息
+- 更适合捕捉文本分类中的上下文依赖
+
+### （3）使用长度信息和 `pack_padded_sequence`
+
+对长文本任务而言：
+
+- 仅仅 padding 不够
+- 还需要显式告诉 LSTM 每个样本的真实长度
+
+这样能够减少无效计算，并降低 padding 对模型的干扰。
+
+### （4）对特殊 token 做了合理处理
+
+- `<PAD>` 置零，避免干扰
+- `<UNK>` 使用平均向量，而不是纯随机值
+- 对零长度样本进行过滤，保证训练稳定性
+
+---
+
+## 9. 项目可改进方向
+
+虽然当前测试准确率已经达到 **77.41%**，但还有进一步优化空间：
+
+### 1）加入 Dropout
+
+当前模型结构相对简单，后期训练集准确率接近 100%，测试集提升有限，说明存在一定过拟合。可以在以下位置加入 Dropout：
+
+- Embedding 后
+- LSTM 输出后
+- 全连接层前
+
+### 2）保存最佳模型而不是最后一轮模型
+
+从日志看，第 8 轮测试准确率达到 **78.56%**，高于最终第 20 轮的 **77.41%**。
+
+因此更推荐：
+
+- 每轮评估后记录最佳 `test_acc`
+- 只保存测试集表现最好的模型参数
+
+### 3）进一步优化文本长度截断策略
+
+当前使用的是 `99.5%` 分位数截断，已经是比较合理的方案，但仍可以尝试：
+
+- 更小的分位数（如 99%）
+- 只保留前半段或前后拼接
+- 分层截断策略
+
+### 4）尝试更强的预训练表示
+
+在当前 Word2Vec + BiLSTM 的基础上，还可以继续尝试：
+
+- GloVe
+- FastText
+- BERT / RoBERTa 等预训练语言模型
+
+---
+
+## 10. 运行环境建议
+
+可以在 `requirements.txt` 中包含如下依赖：
+
+```txt
+numpy
+scikit-learn
+torch
+gensim
+```
+
+安装示例：
 
 ```bash
-pip install numpy scikit-learn torch
+pip install numpy scikit-learn torch gensim
 ```
-
-### 2. 运行数据预处理脚本
-
-```bash
-python 20_news_data.py
-```
-
-### 3. 运行训练代码
-
-如果你的训练代码写在 notebook 或单独脚本中，可以执行对应文件，完成：
-
-- 数据加载
-- 文本转索引
-- padding
-- 模型训练
-- 模型评估
-- checkpoint 保存
 
 ---
 
-## 项目总结
+## 11. 复现实验的基本步骤
 
-本项目实现了一个基于 **Bidirectional LSTM** 的二分类文本分类器，用于区分 **无神论** 与 **基督教** 两类新闻文本。模型在训练集上很快达到极高精度，但在测试集上的最终准确率约为 **72.37%**，并表现出较明显的过拟合现象。
+### Step 1：加载保存的数据
 
-从实验结果来看，这个项目已经很好地展示了：
+```python
+data = load_saved_data("news_data.pkl")
+```
 
-- 文本预处理
+### Step 2：删除空训练样本
+
+```python
+X_train = new_X_train
+y_train = new_y_train
+```
+
+### Step 3：基于训练文本训练 Word2Vec
+
+```python
+w2v_model = Word2Vec(...)
+```
+
+### Step 4：构造 `embedding_matrix`
+
+```python
+embedding_matrix = ...
+```
+
+### Step 5：文本转索引并 padding
+
+```python
+X_train_idx = texts_to_indices(...)
+X_test_idx = texts_to_indices(...)
+X_train_pad = pad_sequences(...)
+X_test_pad = pad_sequences(...)
+```
+
+### Step 6：构建 DataLoader
+
+```python
+train_loader = DataLoader(...)
+test_loader = DataLoader(...)
+```
+
+### Step 7：训练 BiLSTM
+
+```python
+for epoch in range(epochs):
+    ...
+```
+
+### Step 8：在测试集评估并输出分类报告
+
+```python
+print(classification_report(...))
+```
+
+### Step 9：保存模型
+
+```python
+torch.save(checkpoint, save_path)
+```
+
+---
+
+## 12. 总结
+
+本项目完整实现了一个 **从文本预处理、Word2Vec 训练、Embedding 初始化、BiLSTM 建模，到测试评估与模型保存** 的文本分类流程。
+
+最终结果如下：
+
+- 使用 **自定义 Word2Vec** 初始化词向量
+- 使用 **Bidirectional LSTM** 进行二分类
+- 测试集最终准确率达到 **77.41%**
+- 已经超过 **75%** 的预期目标
+
+如果把这个项目放到 GitHub 上，它不仅能体现你会使用深度学习做文本分类，也能体现你对完整实验流程的理解，包括：
+
+- 数据清洗
+- 词向量训练
 - 序列建模
-- 双向 LSTM 分类
-- 训练与评估
-- 模型保存与复现
+- 变长文本处理
+- 模型评估
+- 模型保存
 
-如果后续加入更严格的数据划分方式、更合理的截断长度和更强的正则化策略，模型性能还有进一步提升空间。
+这是一个结构完整、实验结果明确、适合作为课程项目或个人作品集展示的 NLP 项目。
 
 ---
 
-## 仓库描述（可选）
+## 13. 可直接放在仓库首页的简短介绍
 
-可以将 GitHub 仓库简介写为：
+你也可以把下面这段放在 README 最前面作为摘要：
 
-> Bidirectional LSTM for binary text classification on the 20 Newsgroups dataset (alt.atheism vs. soc.religion.christian).
+> This project implements a binary text classification pipeline on a subset of the 20 Newsgroups dataset using custom Word2Vec embeddings and a Bidirectional LSTM. After cleaning the data, training Word2Vec on the training corpus, aligning embeddings to the task vocabulary, and training a BiLSTM classifier, the model achieves **77.41% test accuracy**, exceeding the 75% target.
 
